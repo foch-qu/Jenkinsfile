@@ -1,0 +1,142 @@
+@Library('cop-pipeline-step') _
+def  AWS_DEFAULT_REGION  = "cn-north-1"
+def  AWS_PROFILE         = "clc-nfc-test"
+def  AWS_ACCOUNT_ID      = "034861587527"
+def  AWS_IAM_ROLE        = "ecr-all-policy"
+def  ClusterName         = "NFC-RFID-qa-cluster"
+def  SdbPath             = "shared/t-hub-nonprod/app_properties"
+def  App_properties      = "application-qa.properties"
+def  ENVname             = env.JOB_BASE_NAME.split('-')[0]
+def  PREname             = env.JOB_BASE_NAME.split('-')[1..2].join('-')
+def  Servicename         = env.JOB_BASE_NAME.split('-')[3..-1].join('-')
+def  Git_Repo            = "https://github.com/goaltech/${Servicename}.git"
+def  ValueMap = ['RDS_PS', 'S3_AK', 'S3_SK', 'Redis_URL','RDSFT_PS']
+
+pipeline {
+  agent all
+
+  options {
+    buildDiscarder(logRotator(numToKeepStr: '30', artifactNumToKeepStr: '30'))
+  }
+  parameters {
+    gitParameter branchFilter: 'origin/(.*)', defaultValue: 'master', name: 'Git_Branch', type: 'PT_BRANCH', useRepository: "${Git_Repo}"
+    string(name: 'IMAGE_TAG', defaultValue: 'latest')
+    string(name: 'TaskNum', defaultValue: '1')
+    string(name: 'env', defaultValue: 'qa')
+  }
+  stages {
+    stage('Initialization') {
+      steps {
+        script {
+          buildDescription "Branch:${params.Git_Branch}"
+        }    
+      }
+    }
+    stage('Logging into AWS ECR') {
+      steps {
+        script {
+          withAWS(role:"${AWS_IAM_ROLE}", roleAccount:"${AWS_ACCOUNT_ID}", region: "${AWS_DEFAULT_REGION}") {
+            sh "aws ecr get-login-password --region  ${AWS_DEFAULT_REGION} | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com.cn"        
+          }
+        }
+      } 
+    }
+    stage('Cloning Git') {
+      steps {
+    	git branch: '${Git_Branch}', credentialsId: 'github-token', url: "${Git_Repo}"
+      }
+    }
+        stage('check whether properties file exists') {
+     steps {
+    	script {
+          def propertiesNum = sh(returnStdout: true, script: "find . -type f -name ${App_properties} |grep src | grep resources| wc -l").trim()
+          if (propertiesNum.toInteger() > 0)  {
+            env.propertiesExists = 'true'
+          }
+        }
+      }
+    }
+    stage('check whether Cerberus Key exists') {
+      when {
+        environment name: 'propertiesExists', value: 'true'
+      }
+     steps {
+    	script {
+          def propertiesPath = sh(returnStdout: true, script: "find . -type f -name ${App_properties} -printf '%P\n' | grep resources | grep src").trim()
+          def keyNum = sh(returnStdout: true, script: "grep -E 'RDS_PS|S3_AK|S3_SK|Redis_URL|RDSFT_PS' '${propertiesPath}' | wc -l").trim()
+          if (keyNum.toInteger() > 0) {
+                env.cerneurskeyExists = 'true'
+                env.apppropertiesPath = "${propertiesPath}"
+          }
+        }
+      }
+    }
+    stage ('replace key from cerberus') {
+      when {
+        environment name: 'cerneurskeyExists', value: 'true'
+      }
+      steps {
+        script {
+          def fileContent = readFile(env.apppropertiesPath)
+          for (def value : ValueMap) {
+            if (fileContent.contains(value)) {
+		def cerberusValue
+              withCerberus([
+                env: 'china-v2-test',
+                paths: [[sdbPath: "${SdbPath}", sdbKeys: ["${value}": 'VALUE']]]
+              ]) {
+		  cerberusValue = env.VALUE
+                  sh "sed -i 's|${value}|${cerberusValue}|g' ${env.apppropertiesPath}"
+                 }
+            }
+          }    
+        }
+      }
+    }
+    stage('Build Maven') {
+      steps {
+        script {
+          configFileProvider([configFile(fileId: '37d3b131-c370-4946-985c-61c29a37058b', variable: 'maven_settings')]) {
+            docker.image('public.ecr.aws/docker/library/maven:3.9-amazoncorretto-11').inside('-v $HOME/.m2:/root/.m2') {
+	      sh "mvn clean package -Dmaven.test.skip=true -Dmaven.javadoc.skip=true -s $maven_settings"
+	    }
+          }	
+         }
+      }
+    }
+    stage('Building image') {
+      environment {
+        AWS_DEFAULT_REGION = "${AWS_DEFAULT_REGION}"
+        AWS_ACCOUNT_ID     = "${AWS_ACCOUNT_ID}"
+        IMAGE_REPO_NAME    = "${PREname}-${Servicename}-${ENVname}"
+        REPOSITORY_URI     = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com.cn/${IMAGE_REPO_NAME}"
+      }
+      steps {
+        script {
+          withAWS(role:"${AWS_IAM_ROLE}", roleAccount:"${AWS_ACCOUNT_ID}", region: "${AWS_DEFAULT_REGION}") {
+            sh '''
+	    sed -i "s/\\<test\\>/$env/g"  Dockerfile
+            docker build -f Dockerfile -t ${IMAGE_REPO_NAME}:${IMAGE_TAG} .
+            docker tag ${IMAGE_REPO_NAME}:${IMAGE_TAG} ${REPOSITORY_URI}:${IMAGE_TAG}
+            docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com.cn/${IMAGE_REPO_NAME}:${IMAGE_TAG}
+	    '''
+          }
+        }
+      }
+    }    
+    stage('Rolling update ECS service') {
+      environment {
+        IMAGE_REPO_NAME    = "${PREname}-${Servicename}-${ENVname}"
+        REPOSITORY_URI     = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com.cn/${IMAGE_REPO_NAME}"
+        ECSName            = "${IMAGE_REPO_NAME}-ecs-service"
+      }
+      steps{
+        script {
+          withAWS(role:"${AWS_IAM_ROLE}", roleAccount:"${AWS_ACCOUNT_ID}", region: "${AWS_DEFAULT_REGION}") {
+            sh "aws ecs update-service --cluster ${ClusterName}  --service ${ECSName} --force-new-deployment --desired-count ${TaskNum}"
+          }
+        }
+      }
+    }
+  }
+}
