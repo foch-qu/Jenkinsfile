@@ -1,0 +1,97 @@
+@Library('cop-pipeline-step') _
+def Split_Token       = env.JOB_BASE_NAME.split('-')
+def Service_Name      = env.JOB_BASE_NAME.split('-')[2..-1].join('-')
+def Project_Name      = env.JOB_BASE_NAME.split('-')[0]
+def Remote_Name       = "${Project_Name}Server"
+def Remote_User       = "${Project_Name}admin"
+def Service_Path      = "/${Project_Name}/projects/${Service_Name}"
+def Git_Repo          = "https://github.com/goaltech/${Service_Name}.git"
+def Service_Version   = params.Service_Version
+def deploy            = """
+
+sudo systemctl restart ${Project_Name}-${Service_Name}.service;
+sleep 10;
+sudo systemctl status -l  ${Project_Name}-${Service_Name}.service
+"""
+
+def ServersMap        = [
+    'sfa-msct-internal':           ['10.65.130.13', '10.65.130.28', '10.65.130.114'],
+    'SFA-Insight':                 ['10.65.130.68', '10.65.130.98'],
+
+    
+]
+
+
+
+
+
+pipeline {
+  //agent { label 'msct-devops-node' }
+ agent { label 'msct-om-agent' }
+
+  options {
+    buildDiscarder(logRotator(numToKeepStr: '10'))
+    ansiColor('xterm')
+  }
+  parameters {
+    string(name: 'Git_Branch', defaultValue: 'master')
+  }
+
+  stages {
+    stage("Initialize") {
+      steps {
+        buildDescription "Branch:${params.Git_Branch} Version:${params.Service_Version}"
+      }
+    }
+    stage('Clone') {
+      steps {
+    	git branch: '${Git_Branch}', credentialsId: 'msct-github-token', url: "${Git_Repo}"
+      }
+    }
+    
+   // stage('Build') {
+    //  steps {
+     //   script {
+      //    configFileProvider([configFile(fileId: 'fef1ed2f-5fb8-491a-9f07-054cf23bb4d9', variable: 'maven_settings')]) {
+       //       sh "/home/ec2-user/bmx-node/mvnd-jdk11/bin/mvnd -s $maven_settings -Dmaven.javadoc.skip=tru clean package -Dmaven.test.skip=true"
+        //  }
+       // }
+     // }
+    //}
+
+    stage('Build') {
+      steps {
+        script {
+          configFileProvider([configFile(fileId: 'fef1ed2f-5fb8-491a-9f07-054cf23bb4d9', variable: 'maven_settings')]) {
+            docker.image('public.ecr.aws/docker/library/maven:3.9-amazoncorretto-11').inside() {
+              sh "mvn -s $maven_settings -Dmaven.javadoc.skip=tru clean package -Dmaven.test.skip=true"
+            }
+          }
+        }
+      }
+    }
+
+    stage('Deploy') {
+      steps {
+        script {
+          def jarPath = sh(returnStdout: true, script: "find . -type f -name ${Service_Name}*.jar -printf '%P\n' | sort -n | tail -n 1 | sed 's#^./##g'").trim()
+          if (ServersMap.containsKey(Service_Name)) {
+            def Instances = ServersMap[Service_Name]
+	    for (Instance in Instances) {
+	        def remote = [:]
+	        remote.name = Remote_Name
+	        remote.host = Instance
+                remote.user = Remote_User
+                remote.allowAnyHosts = true
+                withCredentials([sshUserPrivateKey(credentialsId: 'prod_sshkey', keyFileVariable: 'SSH_KEY_PATH')]) {
+                  remote.identityFile = SSH_KEY_PATH
+                  sshPut remote: remote, from: jarPath, into: Service_Path
+                  sshCommand remote: remote, command: "${deploy}"
+                }
+              }
+          }
+        }
+      }
+    }
+  }
+}
