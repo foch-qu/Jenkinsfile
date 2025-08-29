@@ -1,0 +1,135 @@
+
+@Library('cop-pipeline-step') _
+def  JobName = env.JOB_BASE_NAME.split('-')
+def  ServiceName = env.JOB_BASE_NAME.split('-')[0..-1].join('-')
+def  GitName = env.JOB_BASE_NAME.split('-')[0..-2].join('-')
+def  Git_Repo = "https://github.com/abc-goaltech/${ServiceName}.git"
+pipeline {
+  agent { label 'msct-om-agent' }
+	
+  	parameters { 
+  		//string(name: 'ServiceName', defaultValue: 'service-portal-api')
+		string(name: 'ServiceName',  defaultValue: params.ServiceName ?: 'ServiceName')
+    	string(name: 'Branch', defaultValue: 'release/sit')
+        //string(name: 'appservers', defaultValue: 'worker1,worker2,worker3')
+		string(name: 'env', defaultValue: 'sandbox')
+		string(name: 'NodeEnv', defaultValue: 'test')
+		string(name: 'replicas', defaultValue: '3')
+		string(name: 'NameSpace', defaultValue: 'green-return-test')
+		string(name: 'Domain', defaultValue: 'greenreturn-test.abc.com.cn')
+	}
+	options {
+    	buildDiscarder(logRotator(numToKeepStr: '5', artifactNumToKeepStr: '5'))
+		//skipDefaultCheckout(true)
+    	//ansiColor('xterm')
+		timestamps()
+  	}
+
+
+  	stages {
+		// cleanup workspace
+		stage('Initialization') {
+		steps {
+			script {
+			//use name of the patchset as the build name
+			buildDescription "Branch:${params.Branch}"
+		}    
+		}
+		}
+
+
+		stage('Clean Workspace') {
+            steps {
+                cleanWs()
+            }
+        }
+  		// Code Clone
+    	stage('Checkout') {
+    		failFast true
+   	  		steps {
+    			git branch: "${Branch}", credentialsId: "msct-github-token", url: "${Git_Repo}"
+      		}
+    	}
+		stage('Kubectl Verify') { 
+			steps {
+			  script {
+				sh '''
+				set +e
+
+				kubectl
+				
+				if [ $? -ne 0 ];then curl -LO https://s3.us-west-2.amazonaws.com/amazon-eks/1.23.7/2022-06-29/bin/linux/amd64/kubectl; chmod +x kubectl; sudo mv kubectl /usr/local/bin/; echo "\u001B[31mIf the words appears <The connection to the server localhost:8080 was refused - did you specify the right host or port?> Please rebuild\u001B[0m";set +e;kubectl version;fi
+				'''
+
+				}
+						}
+
+		}
+
+
+     	// Building Maven 
+	   stage('Image Build') {
+   	    	steps {
+				script {
+					configFileProvider([configFile(fileId: '897ca726-8f93-431e-aa67-9e9c8ac2ae7f', variable: 'maven_settings')]) {
+					docker.image('public.ecr.aws/docker/library/maven:3.9-amazoncorretto-8').inside('-v $HOME/.m2:/root/.m2') {
+					sh "mvn clean install -U -Dmaven.test.skip=true -P test -s $maven_settings "
+					}
+					}
+					}
+				}
+			
+				}
+
+
+    	stage('Docker Build') {
+			environment{
+			  Service_Name = "${ServiceName}"
+
+			}
+    		failFast true
+			
+   	    	steps {
+				script {
+				configFileProvider([configFile(fileId: '897ca726-8f93-431e-aa67-9e9c8ac2ae7f', variable: 'maven_settings')]) {
+			    withKubeConfig([credentialsId: 'green_return-dev', serverUrl: 'https://139.196.169.171:6443']) {
+				sh '''
+				app=${Service_Name}
+				NameSpace=green-return-test
+				version=`date +%s`
+				repo=alicloud-commons-non-registry.cn-shanghai.cr.aliyuncs.com
+               
+
+				sed -i "s/\\<sit\\>/$env/g"  Dockerfile
+				docker build -t $repo/abc-gr-non/green_return:$app-$version -f Dockerfile .
+				docker login --username=s.greenreturn-cr@gctechopsnon -p ZmFxMjEyQHI1Mwo=  $repo 
+                docker push $repo/abc-gr-non/green_return:$app-$version 
+				sed -i "s/\\<sit\\>/$env/g"  $app-deployment.yaml
+				sed -i "s/\\<3\\>/$replicas/g"  $app-deployment.yaml
+				sed -i "s/\\<dev\\>/$NodeEnv/g"  $app-deployment.yaml
+
+				sed -i "s/\\<green-return-evn\\>/$NameSpace/g"  $app-deployment.yaml
+				sed -i "s/\\<green-return-evn\\>/$NameSpace/g"  $app-svr.yaml
+				sed -i "s/\\<green-return-evn\\>/$NameSpace/g"  $app-route.yaml
+
+				sed -i "s/\\<greenreturn-dev.abc.com.cn\\>/$Domain/g"  $app-route.yaml	
+				sed -i "s/\\<green_return:$app\\>/green_return:$app-$version/g"  $app-deployment.yaml
+
+				dp=`kubectl get deployment -n $NameSpace| grep $app | tr -d \'\n\'`
+				if [ -n "$dp" ];then kubectl apply -f $app-deployment.yaml;fi
+				while :; do kubectl get pods -l app=$app --namespace=$NameSpace | grep -e "Terminating"  -e "ContainerCreating"; num=`kubectl get pods -l app=$app --namespace=$NameSpace | grep -c Running`; if [ $num -eq 3 ]; then echo "pods update success"; break; fi; sleep 5; done
+
+				svr=`kubectl get service -n $NameSpace | grep $app | tr -d \'\n\'`
+				if [ -z "$svr" ];then kubectl apply -f $app-svr.yaml;fi
+				
+				route=`kubectl get ingress -n $NameSpace | grep $app | tr -d \'\n\'`
+				if [ -z "$route" ];then kubectl apply -f $app-route.yaml;fi
+				'''
+	   		}
+   	    	}
+    	}
+		}
+			}
+	}
+
+	}
